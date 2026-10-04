@@ -1,0 +1,207 @@
+# =============================================================================
+# Windows build -- for The Maw. Adapted from SplosionManRecomp's workflow
+# (same house SDK, same two-job shape); the launcher job there has been
+# green since run #1, and the game-job lessons below are inherited from
+# that repo's first runs rather than rediscovered here.
+#
+# Two independent jobs on windows-latest:
+#
+#   game      this repo + ReXGlue SDK at a pinned commit + patches/
+#             house-sdk.patch, built with the repo's win-amd64-release
+#             preset. NOTE: the preset compiles with clang/clang++ and
+#             Ninja -- the "Windows preset" here is NOT MSVC cl.exe.
+#             FidelityFX is forced ON (-DREXGLUE_ENABLE_FIDELITYFX=ON);
+#             without it the runtime silently falls back to bilinear
+#             upscaling (bit us on Linux twice: Condemned v12,
+#             'Splosion Man v2.0).
+#
+#   launcher  the TP house launcher in tp-launcher/ (this same repo --
+#             single checkout, no second source), built for The Maw
+#             with -DTP_GAME=maw against MSVC Qt 6.8.
+#             tp-launcher/CMakeLists.txt defaults TP_GAME=maw already;
+#             the define is passed explicitly so the job can never
+#             silently build the wrong game.
+#
+# Notes and open blockers:
+#   [B1] Codegen must stay a no-op in CI: the committed
+#        generated/default/codegen.d points at the machine the code was
+#        generated on (/home/muse/maw-build/project/...) and lists
+#        assets/default.xex + themaw_config.toml + themaw_manifest.toml
+#        as inputs. The XEX is proprietary and is NOT in this repo, so
+#        on a fresh checkout ninja would re-run codegen and fail. The
+#        "Keep codegen a no-op" step below mirrors the local build fix
+#        (rewrite the depfile prefix to the workspace, refresh both
+#        stamps -- codegen.build.stamp and codegen.stamp -- satisfy the
+#        XEX dep with an empty placeholder). If rexglue grows a
+#        supported codegen-skip switch, use it and delete the step.
+#        Relatedly: the committed generated/ is the POST-FIX state --
+#        scripts/fix-codegen-maw.py and scripts/patch-epilogue.py have
+#        already been applied to it (that's the tree that produced the
+#        shipping Linux build). The local "dance" (codegen -> build ->
+#        fix-codegen-maw.py -> patch-epilogue.py -> build) only matters
+#        if codegen is ever re-run locally; CI never re-runs it.
+#   [B2] The SDK version check (rex_resolve_version in the SDK) hard-
+#        fails when the game repo carries a release tag that reads
+#        "ahead" of the SDK floor -- hit on SplosionManRecomp with its
+#        v1.3 tag (local workaround: park .git during configure/build).
+#        The game checkout therefore uses fetch-tags: false. If
+#        configure still trips the check, the fallback is deleting
+#        local tags in a step before configuring.
+#   [B3] Exact Windows file names for the runtime / GPU-plugin DLLs are
+#        unknown until the first build (Linux ships librexruntime.so +
+#        librexgpu-xenos.so). The artifact step globs *.dll beside the
+#        exe; pin exact names after run #1. Relatedly, the launcher's
+#        Windows program-set names (tp-launcher/src/platform.cpp) are
+#        placeholders pending this same first run.
+#   [B4] The launcher executable is a console-subsystem binary on
+#        Windows (add_executable in tp-launcher lacks the WIN32 flag)
+#        -- cosmetic, fine for the CI milestone. (The game exe itself
+#        is already WIN32-subsystem per the project CMakeLists.)
+#
+# Sources verified publicly cloneable without credentials (2026-10-03):
+# rexglue/rexglue-sdk, rexglue/FidelityFX-SDK, this repo. FidelityFX
+# needs no manual step: the SDK's CMake FetchContent clones
+# rexglue/FidelityFX-SDK at eee08db1688ac3d1275a70b728f4a8ba22914213.
+# The house patch also carries the WIN32 llvm-rc UTF-16 resource fix
+# the FidelityFX build needs under clang on Windows, and the SDK's
+# thirdparty submodules (cli11 et al.) must be initialized or
+# configure fails -- the clone step below does both.
+# =============================================================================
+
+name: Windows build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Exact SDK commit patches/house-sdk.patch was generated from. Do not float.
+  REXSDK_COMMIT: f5337cdc947ff6d4c4196737e2c807a48f2a1fc2
+
+jobs:
+  game:
+    name: Game (themaw.exe + runtime)
+    runs-on: windows-latest
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-tags: false # see [B2]
+
+      - name: Check out ReXGlue SDK (pinned, LF endings)
+        shell: pwsh
+        # Manual clone with autocrlf OFF. actions/checkout on Windows
+        # materializes CRLF files, and git apply then rejects every hunk
+        # of the (LF) house patch -- SplosionManRecomp run #1 failed
+        # exactly this way, all 57 files "patch does not apply". The
+        # build wants LF anyway. Submodules: thirdparty/CMakeLists.txt
+        # hard-fails configure when e.g. cli11 is not initialized.
+        run: |
+          git -c core.autocrlf=false clone --no-checkout https://github.com/rexglue/rexglue-sdk.git rexglue-sdk
+          git -C rexglue-sdk -c core.autocrlf=false checkout ${{ env.REXSDK_COMMIT }}
+          git -C rexglue-sdk -c core.autocrlf=false submodule update --init --recursive
+
+      - name: Apply house SDK patches
+        shell: pwsh
+        working-directory: rexglue-sdk
+        # Verified locally: applies cleanly to a pristine checkout of
+        # the pinned commit (git apply --check, 57 files).
+        run: git apply --whitespace=nowarn --ignore-whitespace ../repo/patches/house-sdk.patch
+
+      - name: Keep codegen a no-op (no XEX in CI)
+        shell: pwsh
+        working-directory: repo
+        # See [B1]. Mirrors the local build fix. The Maw depfile's
+        # prefix is the machine path below (not the Splosion one).
+        run: |
+          $repoFwd = "$env:GITHUB_WORKSPACE/repo" -replace '\\', '/'
+          (Get-Content generated/default/codegen.d -Raw) `
+            -replace '/home/muse/maw-build/project', $repoFwd |
+            Set-Content generated/default/codegen.d -NoNewline
+          if (-not (Test-Path assets)) {
+            # Fresh checkouts have no assets/ at all (gitignored).
+            New-Item -ItemType Directory assets | Out-Null
+          }
+          if (-not (Test-Path assets/default.xex)) {
+            # Placeholder only: satisfies the depfile input so ninja
+            # skips codegen. Never read, never shipped.
+            New-Item -ItemType File assets/default.xex | Out-Null
+          }
+          # Stamps must be newer than every depfile input.
+          foreach ($stamp in @('generated/default/codegen.build.stamp', 'generated/default/codegen.stamp')) {
+            if (-not (Test-Path $stamp)) { New-Item -ItemType File $stamp | Out-Null }
+            (Get-Item $stamp).LastWriteTimeUtc = [DateTime]::UtcNow
+          }
+
+      - name: Configure (win-amd64-release preset, FidelityFX ON)
+        shell: pwsh
+        working-directory: repo
+        run: >
+          cmake --preset win-amd64-release
+          -DREXSDK_DIR="$env:GITHUB_WORKSPACE/rexglue-sdk"
+          -DREXGLUE_ENABLE_FIDELITYFX=ON
+
+      - name: Build
+        shell: pwsh
+        working-directory: repo
+        run: cmake --build --preset win-amd64-release
+
+      - name: Upload game artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: themaw-windows-game
+          # See [B3]: the exe name is set by the repo's CMake (themaw);
+          # runtime/plugin DLL names get pinned after the first run.
+          path: |
+            repo/out/build/win-amd64-release/themaw.exe
+            repo/out/build/win-amd64-release/*.dll
+          if-no-files-found: error
+
+  launcher:
+    name: TP launcher (The Maw)
+    runs-on: windows-latest
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Install Qt 6.8 (MSVC 2022 x64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.*'
+          arch: win64_msvc2022_64
+          # tp-launcher needs Qt6 Widgets only (CMakeLists verified).
+          # Local dev used Qt 6.4.2 (container) and 6.10.2 (host).
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure launcher (TP_GAME=maw)
+        shell: pwsh
+        run: >
+          cmake -S tp-launcher -B tp-launcher/out/build/win -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DTP_GAME=maw
+
+      - name: Build launcher
+        shell: pwsh
+        run: cmake --build tp-launcher/out/build/win
+
+      - name: Deploy Qt runtime next to the exe
+        shell: pwsh
+        run: windeployqt tp-launcher/out/build/win/TPMawLauncher.exe
+
+      - name: Upload launcher artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tp-launcher-maw-windows
+          path: |
+            tp-launcher/out/build/win/TPMawLauncher.exe
+            tp-launcher/out/build/win/*.dll
+            tp-launcher/out/build/win/platforms/**
+            tp-launcher/out/build/win/styles/**
+            tp-launcher/out/build/win/imageformats/**
+            tp-launcher/out/build/win/tls/**
+          if-no-files-found: error
